@@ -1,205 +1,430 @@
-"""Tests for Delegation module."""
+"""
+Tests for Delegation-based Secret Sharing.
+
+Tests the formulas with hardcoded values:
+- Scheme 1: K_D = KDF(s)
+- Scheme 2: K_D^C = KDF(H(s || caps))
+- User composition: K_U* = KDF(K_U || K_D)
+- Security properties
+"""
 
 import pytest
 from ensf.crypto.delegation import (
     DelegationScheme,
-    DelegationKey,
-    AdminShare,
+    Capability,
     compose_user_key,
+    encrypt_data,
+    decrypt_data,
+    kdf,
+    hash_with_capabilities,
 )
-from ensf.crypto.capability import Capability, CapabilityKey
-from ensf.crypto.aes import KEY_SIZE
 
 
-class TestDelegationKey:
-    """Tests for DelegationKey."""
+# =============================================================================
+# HARDCODED TEST VALUES
+# =============================================================================
 
-    def test_has_capability_empty_means_read(self):
-        """Empty capabilities should grant read-only."""
-        dk = DelegationKey(key=b"x" * KEY_SIZE, capabilities=set())
+# Threshold W = 3
+THRESHOLD = 3
 
-        assert dk.has_capability(Capability.READ) is True
-        assert dk.has_capability(Capability.WRITE) is False
-        assert dk.has_capability(Capability.DELETE) is False
+# Admin weights
+ADMIN_WEIGHTS = {
+    "admin1": 2,  # w_1 = 2
+    "admin2": 1,  # w_2 = 1
+    "admin3": 1,  # w_3 = 1
+}
 
-    def test_has_capability_with_caps(self):
-        """Should correctly report granted capabilities."""
-        dk = DelegationKey(
-            key=b"x" * KEY_SIZE, capabilities={Capability.READ, Capability.WRITE}
-        )
+# User key K_U (32 bytes)
+USER_KEY = b"user_secret_key_32bytes_padding_"
 
-        assert dk.has_capability(Capability.READ) is True
-        assert dk.has_capability(Capability.WRITE) is True
-        assert dk.has_capability(Capability.DELETE) is False
+# Capability keys for admin1 (32 bytes each)
+CAPABILITY_KEYS = {
+    Capability.READ: b"read_capability_key_32bytes_____",
+    Capability.WRITE: b"write_capability_key_32bytes____",
+    Capability.DELETE: b"delete_capability_key_32bytes___",
+}
 
-    def test_to_bytes_and_from_bytes(self):
-        """Round-trip serialization."""
-        dk = DelegationKey(
-            key=b"y" * KEY_SIZE, capabilities={Capability.WRITE, Capability.DELETE}
-        )
-
-        data = dk.to_bytes()
-        recovered = DelegationKey.from_bytes(data)
-
-        assert recovered.key == dk.key
-        assert recovered.capabilities == dk.capabilities
+# Test data
+TEST_DATA = b"This is the user's private data D_U"
 
 
-class TestDelegationScheme:
-    """Tests for DelegationScheme."""
+# =============================================================================
+# TEST CLASSES
+# =============================================================================
 
-    def test_validate_coalition_valid(self):
-        """Coalition meeting threshold should be valid."""
-        scheme = DelegationScheme(threshold=5)
 
-        assert scheme.validate_coalition({"A": 3, "B": 2}) is True
-        assert scheme.validate_coalition({"A": 5}) is True
-        assert scheme.validate_coalition({"A": 2, "B": 2, "C": 1}) is True
+class TestCoalitionValidation:
+    """Test coalition weight validation: Σw_i ≥ W"""
 
-    def test_validate_coalition_invalid(self):
-        """Coalition below threshold should be invalid."""
-        scheme = DelegationScheme(threshold=5)
+    def test_valid_coalition_meets_threshold(self):
+        """Coalition with Σw_i ≥ W should be valid."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
 
-        assert scheme.validate_coalition({"A": 2, "B": 2}) is False
-        assert scheme.validate_coalition({"A": 4}) is False
+        # admin1 + admin2 = 2 + 1 = 3 >= 3
+        assert scheme.validate_coalition({"admin1": 2, "admin2": 1}) is True
 
-    def test_share_secret_distributes_by_weight(self):
-        """Each admin should get shares equal to their weight."""
-        scheme = DelegationScheme(threshold=3)
+        # admin1 + admin3 = 2 + 1 = 3 >= 3
+        assert scheme.validate_coalition({"admin1": 2, "admin3": 1}) is True
+
+        # all admins = 4 >= 3
+        assert scheme.validate_coalition(ADMIN_WEIGHTS) is True
+
+    def test_invalid_coalition_below_threshold(self):
+        """Coalition with Σw_i < W should be invalid."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
+
+        # admin1 alone = 2 < 3
+        assert scheme.validate_coalition({"admin1": 2}) is False
+
+        # admin2 + admin3 = 1 + 1 = 2 < 3
+        assert scheme.validate_coalition({"admin2": 1, "admin3": 1}) is False
+
+    def test_share_secret_rejects_invalid_coalition(self):
+        """share_secret should raise error for invalid coalition."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
         secret = scheme.generate_secret()
 
-        shares = scheme.share_secret(secret, {"A": 2, "B": 1})
+        with pytest.raises(ValueError, match="Invalid coalition"):
+            scheme.share_secret(secret, {"admin1": 2})  # weight 2 < 3
 
-        assert len(shares["A"]) == 2
-        assert len(shares["B"]) == 1
 
-    def test_share_secret_insufficient_coalition_fails(self):
-        """Sharing with insufficient coalition should fail."""
-        scheme = DelegationScheme(threshold=5)
+class TestSecretSharing:
+    """Test secret sharing: {s_i} ← Share(s) and s = Rec({s_i})"""
+
+    def test_share_distributes_by_weight(self):
+        """Each admin should receive shares equal to their weight."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
         secret = scheme.generate_secret()
 
-        with pytest.raises(ValueError, match="Coalition weight"):
-            scheme.share_secret(secret, {"A": 2, "B": 2})
+        shares = scheme.share_secret(secret, {"admin1": 2, "admin2": 1})
 
-    def test_reconstruct_with_threshold(self):
-        """Reconstruction with threshold shares should succeed."""
-        scheme = DelegationScheme(threshold=3)
+        assert len(shares["admin1"]) == 2  # weight 2
+        assert len(shares["admin2"]) == 1  # weight 1
+
+    def test_reconstruct_with_sufficient_shares(self):
+        """Reconstruction with ≥ threshold shares should succeed."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
+        secret = 12345  # Fixed secret for testing
+
+        shares = scheme.share_secret(secret, {"admin1": 2, "admin2": 1})
+
+        # Combine all shares
+        all_shares = shares["admin1"] + shares["admin2"]
+        reconstructed = scheme.reconstruct_secret(all_shares)
+
+        assert reconstructed == secret
+
+    def test_reconstruct_with_different_subsets(self):
+        """Any subset of shares meeting threshold should work."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
+        secret = 99999
+
+        shares = scheme.share_secret(secret, ADMIN_WEIGHTS)
+
+        # admin1(2) + admin2(1) = 3 shares
+        subset1 = shares["admin1"] + shares["admin2"]
+        assert scheme.reconstruct_secret(subset1) == secret
+
+        # admin1(2) + admin3(1) = 3 shares
+        subset2 = shares["admin1"] + shares["admin3"]
+        assert scheme.reconstruct_secret(subset2) == secret
+
+
+class TestScheme1:
+    """Test Scheme 1: K_D = KDF(s)"""
+
+    def test_scheme1_derives_key(self):
+        """Scheme 1 should derive 32-byte key from secret."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
         secret = scheme.generate_secret()
 
-        shares = scheme.share_secret(secret, {"A": 2, "B": 1})
-        all_shares = shares["A"] + shares["B"]
+        result = scheme.derive_delegation_key_scheme1(secret)
 
-        recovered = scheme.reconstruct_secret(all_shares)
-        assert recovered == secret
+        assert len(result.key) == 32
+        assert result.capabilities == set()  # read-only
 
-    def test_scheme1_produces_valid_key(self):
-        """Scheme 1 should produce correct size key with no capabilities."""
-        scheme = DelegationScheme(threshold=2)
+    def test_scheme1_deterministic(self):
+        """Same secret should produce same key."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
+        secret = 12345
+
+        result1 = scheme.derive_delegation_key_scheme1(secret)
+        result2 = scheme.derive_delegation_key_scheme1(secret)
+
+        assert result1.key == result2.key
+
+    def test_scheme1_different_secrets_different_keys(self):
+        """Different secrets should produce different keys."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
+
+        result1 = scheme.derive_delegation_key_scheme1(100)
+        result2 = scheme.derive_delegation_key_scheme1(200)
+
+        assert result1.key != result2.key
+
+
+class TestScheme2:
+    """Test Scheme 2: K_D^C = KDF(H(s || K_j^op for op ∈ C))"""
+
+    def test_scheme2_derives_key_with_capabilities(self):
+        """Scheme 2 should include capabilities in result."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
         secret = scheme.generate_secret()
 
-        dk = scheme.derive_delegation_key_scheme1(secret)
+        caps = {Capability.READ: CAPABILITY_KEYS[Capability.READ]}
+        result = scheme.derive_delegation_key_scheme2(secret, caps)
 
-        assert len(dk.key) == KEY_SIZE
-        assert dk.capabilities == set()
+        assert len(result.key) == 32
+        assert Capability.READ in result.capabilities
 
-    def test_scheme2_produces_key_with_capabilities(self):
-        """Scheme 2 should include capabilities in delegation key."""
-        scheme = DelegationScheme(threshold=2)
-        secret = scheme.generate_secret()
-
-        cap_keys = [
-            CapabilityKey.generate(Capability.READ),
-            CapabilityKey.generate(Capability.WRITE),
-        ]
-
-        dk = scheme.derive_delegation_key_scheme2(secret, cap_keys)
-
-        assert len(dk.key) == KEY_SIZE
-        assert Capability.READ in dk.capabilities
-        assert Capability.WRITE in dk.capabilities
-        assert Capability.DELETE not in dk.capabilities
-
-    def test_scheme2_no_caps_falls_back_to_scheme1(self):
-        """Scheme 2 with empty capabilities should behave like Scheme 1."""
-        scheme = DelegationScheme(threshold=2)
-        secret = scheme.generate_secret()
-
-        dk1 = scheme.derive_delegation_key_scheme1(secret)
-        dk2 = scheme.derive_delegation_key_scheme2(secret, [])
-
-        # Same key (both use scheme1 derivation)
-        assert dk1.key == dk2.key
-
-    def test_different_capabilities_different_keys(self):
+    def test_scheme2_different_caps_different_keys(self):
         """Different capability sets should produce different keys."""
-        scheme = DelegationScheme(threshold=2)
-        secret = scheme.generate_secret()
+        scheme = DelegationScheme(threshold=THRESHOLD)
+        secret = 12345
 
-        cap_read = [CapabilityKey.generate(Capability.READ)]
-        cap_write = [CapabilityKey.generate(Capability.WRITE)]
+        caps_read = {Capability.READ: CAPABILITY_KEYS[Capability.READ]}
+        caps_write = {Capability.WRITE: CAPABILITY_KEYS[Capability.WRITE]}
 
-        dk1 = scheme.derive_delegation_key_scheme2(secret, cap_read)
-        dk2 = scheme.derive_delegation_key_scheme2(secret, cap_write)
+        result1 = scheme.derive_delegation_key_scheme2(secret, caps_read)
+        result2 = scheme.derive_delegation_key_scheme2(secret, caps_write)
 
-        assert dk1.key != dk2.key
+        assert result1.key != result2.key
+
+    def test_scheme2_multiple_capabilities(self):
+        """Multiple capabilities should all be included."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
+        secret = 12345
+
+        caps = {
+            Capability.READ: CAPABILITY_KEYS[Capability.READ],
+            Capability.WRITE: CAPABILITY_KEYS[Capability.WRITE],
+        }
+        result = scheme.derive_delegation_key_scheme2(secret, caps)
+
+        assert result.capabilities == {Capability.READ, Capability.WRITE}
+
+    def test_scheme2_empty_caps_equals_scheme1(self):
+        """Empty capabilities should fall back to Scheme 1."""
+        scheme = DelegationScheme(threshold=THRESHOLD)
+        secret = 12345
+
+        result1 = scheme.derive_delegation_key_scheme1(secret)
+        result2 = scheme.derive_delegation_key_scheme2(secret, {})
+
+        assert result1.key == result2.key
 
 
-class TestComposeUserKey:
-    """Tests for user key composition."""
+class TestUserKeyComposition:
+    """Test user key composition: K_U* = KDF(K_U || K_D)"""
 
-    def test_compose_user_key_produces_valid_key(self):
-        """Composed key should be correct size."""
-        user_key = b"u" * KEY_SIZE
-        dk = DelegationKey(key=b"d" * KEY_SIZE, capabilities=set())
+    def test_compose_produces_valid_key(self):
+        """Composed key should be 32 bytes."""
+        delegation_key = b"d" * 32
 
-        composed = compose_user_key(user_key, dk)
+        composed = compose_user_key(USER_KEY, delegation_key)
 
-        assert len(composed) == KEY_SIZE
+        assert len(composed) == 32
 
-    def test_compose_key_deterministic(self):
+    def test_compose_deterministic(self):
         """Same inputs should produce same composed key."""
-        user_key = b"u" * KEY_SIZE
-        dk = DelegationKey(key=b"d" * KEY_SIZE, capabilities=set())
+        delegation_key = b"d" * 32
 
-        composed1 = compose_user_key(user_key, dk)
-        composed2 = compose_user_key(user_key, dk)
+        composed1 = compose_user_key(USER_KEY, delegation_key)
+        composed2 = compose_user_key(USER_KEY, delegation_key)
 
         assert composed1 == composed2
 
     def test_different_user_keys_different_composed(self):
         """Different user keys should produce different composed keys."""
-        dk = DelegationKey(key=b"d" * KEY_SIZE, capabilities=set())
+        delegation_key = b"d" * 32
+        user_key1 = b"a" * 32
+        user_key2 = b"b" * 32
 
-        composed1 = compose_user_key(b"a" * KEY_SIZE, dk)
-        composed2 = compose_user_key(b"b" * KEY_SIZE, dk)
+        composed1 = compose_user_key(user_key1, delegation_key)
+        composed2 = compose_user_key(user_key2, delegation_key)
 
         assert composed1 != composed2
 
     def test_different_delegation_keys_different_composed(self):
         """Different delegation keys should produce different composed keys."""
-        user_key = b"u" * KEY_SIZE
-        dk1 = DelegationKey(key=b"a" * KEY_SIZE, capabilities=set())
-        dk2 = DelegationKey(key=b"b" * KEY_SIZE, capabilities=set())
-
-        composed1 = compose_user_key(user_key, dk1)
-        composed2 = compose_user_key(user_key, dk2)
+        composed1 = compose_user_key(USER_KEY, b"a" * 32)
+        composed2 = compose_user_key(USER_KEY, b"b" * 32)
 
         assert composed1 != composed2
 
 
-class TestAdminShare:
-    """Tests for AdminShare serialization."""
+class TestEncryptionDecryption:
+    """Test encryption/decryption: C = Enc(D_U), D_U = Dec(C)"""
 
-    def test_to_bytes_and_from_bytes(self):
-        """Round-trip serialization."""
-        from ensf.crypto.shamir import Share
+    def test_round_trip(self):
+        """Dec(Enc(D_U)) should equal D_U."""
+        key = b"k" * 32
 
-        shares = [Share(x=1, y=100), Share(x=2, y=200)]
-        admin_share = AdminShare(admin_id="admin1", shares=shares)
+        ciphertext = encrypt_data(TEST_DATA, key)
+        plaintext = decrypt_data(ciphertext, key)
 
-        data = admin_share.to_bytes()
-        recovered = AdminShare.from_bytes(data)
+        assert plaintext == TEST_DATA
 
-        assert recovered.admin_id == "admin1"
-        assert len(recovered.shares) == 2
-        assert recovered.shares[0].x == 1
+    def test_wrong_key_fails(self):
+        """Decryption with wrong key should produce garbage."""
+        key1 = b"a" * 32
+        key2 = b"b" * 32
+
+        ciphertext = encrypt_data(TEST_DATA, key1)
+        wrong_plaintext = decrypt_data(ciphertext, key2)
+
+        assert wrong_plaintext != TEST_DATA
+
+
+class TestSecurityProperties:
+    """Test security guarantees from specification."""
+
+    def test_insufficient_coalition_cannot_derive_key(self):
+        """
+        If Σw_i < W, Pr[K_D known] ≈ 0
+
+        Coalition below threshold cannot create valid secret sharing.
+        """
+        scheme = DelegationScheme(threshold=THRESHOLD)
+        secret = scheme.generate_secret()
+
+        # Cannot even share the secret with insufficient coalition
+        with pytest.raises(ValueError):
+            scheme.share_secret(secret, {"admin2": 1})  # weight 1 < 3
+
+    def test_admin_alone_cannot_access_data(self):
+        """
+        Without K_U, Pr[admin gets D_U] ≈ 0
+
+        Admin has delegation key but not user key.
+        """
+        scheme = DelegationScheme(threshold=THRESHOLD)
+        secret = scheme.generate_secret()
+
+        # Admin creates delegation key
+        delegation = scheme.derive_delegation_key_scheme1(secret)
+
+        # User encrypts data with composed key
+        composed_key = compose_user_key(USER_KEY, delegation.key)
+        ciphertext = encrypt_data(TEST_DATA, composed_key)
+
+        # Admin tries to decrypt with just delegation key (wrong)
+        wrong_plaintext = decrypt_data(ciphertext, delegation.key)
+        assert wrong_plaintext != TEST_DATA
+
+    def test_user_alone_cannot_access_data(self):
+        """
+        Without K_D, user cannot decrypt.
+
+        User has their key but no delegation from admins.
+        """
+        scheme = DelegationScheme(threshold=THRESHOLD)
+        secret = scheme.generate_secret()
+
+        # Create correct composed key
+        delegation = scheme.derive_delegation_key_scheme1(secret)
+        composed_key = compose_user_key(USER_KEY, delegation.key)
+
+        # Encrypt data
+        ciphertext = encrypt_data(TEST_DATA, composed_key)
+
+        # User tries with only their key (wrong)
+        wrong_plaintext = decrypt_data(ciphertext, USER_KEY)
+        assert wrong_plaintext != TEST_DATA
+
+    def test_admin_and_user_together_can_access(self):
+        """
+        Admin coalition + user = successful access.
+        """
+        scheme = DelegationScheme(threshold=THRESHOLD)
+        secret = scheme.generate_secret()
+
+        # Admin coalition creates and shares secret
+        shares = scheme.share_secret(secret, {"admin1": 2, "admin2": 1})
+
+        # Reconstruct
+        all_shares = shares["admin1"] + shares["admin2"]
+        reconstructed = scheme.reconstruct_secret(all_shares)
+
+        # Derive delegation key
+        delegation = scheme.derive_delegation_key_scheme1(reconstructed)
+
+        # User composes key
+        composed_key = compose_user_key(USER_KEY, delegation.key)
+
+        # Encrypt and decrypt
+        ciphertext = encrypt_data(TEST_DATA, composed_key)
+        plaintext = decrypt_data(ciphertext, composed_key)
+
+        assert plaintext == TEST_DATA
+
+
+class TestEndToEndScenarios:
+    """Complete workflow tests."""
+
+    def test_scheme1_full_workflow(self):
+        """
+        Full Scheme 1 workflow:
+        1. Admins form coalition
+        2. Generate and share secret
+        3. Derive K_D = KDF(s)
+        4. User composes K_U* = KDF(K_U || K_D)
+        5. Encrypt/decrypt data
+        """
+        # Setup
+        scheme = DelegationScheme(threshold=THRESHOLD)
+
+        # Step 1-2: Coalition generates secret
+        secret = scheme.generate_secret()
+        shares = scheme.share_secret(secret, {"admin1": 2, "admin2": 1})
+
+        # Step 3: Reconstruct and derive K_D
+        all_shares = shares["admin1"] + shares["admin2"]
+        reconstructed = scheme.reconstruct_secret(all_shares)
+        delegation = scheme.derive_delegation_key_scheme1(reconstructed)
+
+        # Step 4: User composes key
+        user_composed = compose_user_key(USER_KEY, delegation.key)
+
+        # Step 5: Encrypt/decrypt
+        ciphertext = encrypt_data(TEST_DATA, user_composed)
+        plaintext = decrypt_data(ciphertext, user_composed)
+
+        assert plaintext == TEST_DATA
+        assert delegation.capabilities == set()  # read-only
+
+    def test_scheme2_full_workflow(self):
+        """
+        Full Scheme 2 workflow with capabilities:
+        1. Admins form coalition
+        2. Generate and share secret
+        3. Derive K_D^C = KDF(H(s || caps))
+        4. User composes K_U* = KDF(K_U || K_D^C)
+        5. Encrypt/decrypt data
+        """
+        # Setup
+        scheme = DelegationScheme(threshold=THRESHOLD)
+
+        # Step 1-2: Coalition generates secret
+        secret = scheme.generate_secret()
+        shares = scheme.share_secret(secret, {"admin1": 2, "admin2": 1})
+
+        # Step 3: Reconstruct and derive K_D^C with read+write
+        all_shares = shares["admin1"] + shares["admin2"]
+        reconstructed = scheme.reconstruct_secret(all_shares)
+
+        caps = {
+            Capability.READ: CAPABILITY_KEYS[Capability.READ],
+            Capability.WRITE: CAPABILITY_KEYS[Capability.WRITE],
+        }
+        delegation = scheme.derive_delegation_key_scheme2(reconstructed, caps)
+
+        # Step 4: User composes key
+        user_composed = compose_user_key(USER_KEY, delegation.key)
+
+        # Step 5: Encrypt/decrypt
+        ciphertext = encrypt_data(TEST_DATA, user_composed)
+        plaintext = decrypt_data(ciphertext, user_composed)
+
+        assert plaintext == TEST_DATA
+        assert delegation.capabilities == {Capability.READ, Capability.WRITE}
