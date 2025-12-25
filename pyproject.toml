@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ensf"
+version = "0.1.0"
+description = "Hierarchical Folder Encryption using Chained Weighted Secret Sharing"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "ENSF Team" }
+]
+dependencies = [
+    "cryptography>=41.0.0",
+    "sympy>=1.12",
+    "typer>=0.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+]
+
+[project.scripts]
+ensf = "ensf.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ensf"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
