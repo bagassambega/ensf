@@ -1,430 +1,505 @@
 """
-Tests for Delegation-based Secret Sharing.
+Tests for Formal Delegation Scheme.
 
-Tests the formulas with hardcoded values:
-- Scheme 1: K_D = KDF(s)
-- Scheme 2: K_D^C = KDF(H(s || caps))
-- User composition: K_U* = KDF(K_U || K_D)
-- Security properties
+Implements the toy example from specification:
+    p = 17
+    Admins: A_1, A_2, A_3 with w_1=2, w_2=1, w_3=1
+    Thresholds: W_read=3, W_cap=3
+    User key: K_U = 7
+    Master secret: s = 5
+    Polynomial: f(x) = 5 + 3x mod 17
+    Shares: s_1=8, s_2=11, s_3=14
+
+Plus 3 comprehensive test cases.
 """
 
 import pytest
 from ensf.crypto.delegation import (
     DelegationScheme,
-    Capability,
-    compose_user_key,
-    encrypt_data,
-    decrypt_data,
+    Operation,
+    Administrator,
+    DelegationKeys,
+    UserKeys,
+    AuthenticatedCiphertext,
+    encrypt,
+    decrypt,
+    encrypt_auth,
+    decrypt_auth,
     kdf,
-    hash_with_capabilities,
+    hash_concat,
+    phi,
 )
+from ensf.crypto.shamir import Share, generate_shares, reconstruct_secret
 
 
 # =============================================================================
-# HARDCODED TEST VALUES
+# TOY EXAMPLE CONSTANTS (p=17)
 # =============================================================================
 
-# Threshold W = 3
-THRESHOLD = 3
+P = 17  # Prime field
 
-# Admin weights
-ADMIN_WEIGHTS = {
-    "admin1": 2,  # w_1 = 2
-    "admin2": 1,  # w_2 = 1
-    "admin3": 1,  # w_3 = 1
-}
+# Administrators
+ADMIN_WEIGHTS = {1: 2, 2: 1, 3: 1}  # A_1: w=2, A_2: w=1, A_3: w=1
 
-# User key K_U (32 bytes)
-USER_KEY = b"user_secret_key_32bytes_padding_"
+# Thresholds
+W_READ = 3
+W_CAP = 3
 
-# Capability keys for admin1 (32 bytes each)
-CAPABILITY_KEYS = {
-    Capability.READ: b"read_capability_key_32bytes_____",
-    Capability.WRITE: b"write_capability_key_32bytes____",
-    Capability.DELETE: b"delete_capability_key_32bytes___",
-}
+# User
+K_U = 7
 
-# Test data
-TEST_DATA = b"This is the user's private data D_U"
+# Master secret
+S = 5
+
+# Polynomial f(x) = 5 + 3x => shares: f(1)=8, f(2)=11, f(3)=14
+SHARES = {1: 8, 2: 11, 3: 14}
+
+# Capability key for A_1
+K_1_WRITE = 6
 
 
 # =============================================================================
-# TEST CLASSES
+# TEST: TOY EXAMPLE FROM SPECIFICATION
 # =============================================================================
 
 
-class TestCoalitionValidation:
-    """Test coalition weight validation: Σw_i ≥ W"""
-
-    def test_valid_coalition_meets_threshold(self):
-        """Coalition with Σw_i ≥ W should be valid."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-
-        # admin1 + admin2 = 2 + 1 = 3 >= 3
-        assert scheme.validate_coalition({"admin1": 2, "admin2": 1}) is True
-
-        # admin1 + admin3 = 2 + 1 = 3 >= 3
-        assert scheme.validate_coalition({"admin1": 2, "admin3": 1}) is True
-
-        # all admins = 4 >= 3
-        assert scheme.validate_coalition(ADMIN_WEIGHTS) is True
-
-    def test_invalid_coalition_below_threshold(self):
-        """Coalition with Σw_i < W should be invalid."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-
-        # admin1 alone = 2 < 3
-        assert scheme.validate_coalition({"admin1": 2}) is False
-
-        # admin2 + admin3 = 1 + 1 = 2 < 3
-        assert scheme.validate_coalition({"admin2": 1, "admin3": 1}) is False
-
-    def test_share_secret_rejects_invalid_coalition(self):
-        """share_secret should raise error for invalid coalition."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = scheme.generate_secret()
-
-        with pytest.raises(ValueError, match="Invalid coalition"):
-            scheme.share_secret(secret, {"admin1": 2})  # weight 2 < 3
-
-
-class TestSecretSharing:
-    """Test secret sharing: {s_i} ← Share(s) and s = Rec({s_i})"""
-
-    def test_share_distributes_by_weight(self):
-        """Each admin should receive shares equal to their weight."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = scheme.generate_secret()
-
-        shares = scheme.share_secret(secret, {"admin1": 2, "admin2": 1})
-
-        assert len(shares["admin1"]) == 2  # weight 2
-        assert len(shares["admin2"]) == 1  # weight 1
-
-    def test_reconstruct_with_sufficient_shares(self):
-        """Reconstruction with ≥ threshold shares should succeed."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = 12345  # Fixed secret for testing
-
-        shares = scheme.share_secret(secret, {"admin1": 2, "admin2": 1})
-
-        # Combine all shares
-        all_shares = shares["admin1"] + shares["admin2"]
-        reconstructed = scheme.reconstruct_secret(all_shares)
-
-        assert reconstructed == secret
-
-    def test_reconstruct_with_different_subsets(self):
-        """Any subset of shares meeting threshold should work."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = 99999
-
-        shares = scheme.share_secret(secret, ADMIN_WEIGHTS)
-
-        # admin1(2) + admin2(1) = 3 shares
-        subset1 = shares["admin1"] + shares["admin2"]
-        assert scheme.reconstruct_secret(subset1) == secret
-
-        # admin1(2) + admin3(1) = 3 shares
-        subset2 = shares["admin1"] + shares["admin3"]
-        assert scheme.reconstruct_secret(subset2) == secret
-
-
-class TestScheme1:
-    """Test Scheme 1: K_D = KDF(s)"""
-
-    def test_scheme1_derives_key(self):
-        """Scheme 1 should derive 32-byte key from secret."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = scheme.generate_secret()
-
-        result = scheme.derive_delegation_key_scheme1(secret)
-
-        assert len(result.key) == 32
-        assert result.capabilities == set()  # read-only
-
-    def test_scheme1_deterministic(self):
-        """Same secret should produce same key."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = 12345
-
-        result1 = scheme.derive_delegation_key_scheme1(secret)
-        result2 = scheme.derive_delegation_key_scheme1(secret)
-
-        assert result1.key == result2.key
-
-    def test_scheme1_different_secrets_different_keys(self):
-        """Different secrets should produce different keys."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-
-        result1 = scheme.derive_delegation_key_scheme1(100)
-        result2 = scheme.derive_delegation_key_scheme1(200)
-
-        assert result1.key != result2.key
-
-
-class TestScheme2:
-    """Test Scheme 2: K_D^C = KDF(H(s || K_j^op for op ∈ C))"""
-
-    def test_scheme2_derives_key_with_capabilities(self):
-        """Scheme 2 should include capabilities in result."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = scheme.generate_secret()
-
-        caps = {Capability.READ: CAPABILITY_KEYS[Capability.READ]}
-        result = scheme.derive_delegation_key_scheme2(secret, caps)
-
-        assert len(result.key) == 32
-        assert Capability.READ in result.capabilities
-
-    def test_scheme2_different_caps_different_keys(self):
-        """Different capability sets should produce different keys."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = 12345
-
-        caps_read = {Capability.READ: CAPABILITY_KEYS[Capability.READ]}
-        caps_write = {Capability.WRITE: CAPABILITY_KEYS[Capability.WRITE]}
-
-        result1 = scheme.derive_delegation_key_scheme2(secret, caps_read)
-        result2 = scheme.derive_delegation_key_scheme2(secret, caps_write)
-
-        assert result1.key != result2.key
-
-    def test_scheme2_multiple_capabilities(self):
-        """Multiple capabilities should all be included."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = 12345
-
-        caps = {
-            Capability.READ: CAPABILITY_KEYS[Capability.READ],
-            Capability.WRITE: CAPABILITY_KEYS[Capability.WRITE],
-        }
-        result = scheme.derive_delegation_key_scheme2(secret, caps)
-
-        assert result.capabilities == {Capability.READ, Capability.WRITE}
-
-    def test_scheme2_empty_caps_equals_scheme1(self):
-        """Empty capabilities should fall back to Scheme 1."""
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = 12345
-
-        result1 = scheme.derive_delegation_key_scheme1(secret)
-        result2 = scheme.derive_delegation_key_scheme2(secret, {})
-
-        assert result1.key == result2.key
-
-
-class TestUserKeyComposition:
-    """Test user key composition: K_U* = KDF(K_U || K_D)"""
-
-    def test_compose_produces_valid_key(self):
-        """Composed key should be 32 bytes."""
-        delegation_key = b"d" * 32
-
-        composed = compose_user_key(USER_KEY, delegation_key)
-
-        assert len(composed) == 32
-
-    def test_compose_deterministic(self):
-        """Same inputs should produce same composed key."""
-        delegation_key = b"d" * 32
-
-        composed1 = compose_user_key(USER_KEY, delegation_key)
-        composed2 = compose_user_key(USER_KEY, delegation_key)
-
-        assert composed1 == composed2
-
-    def test_different_user_keys_different_composed(self):
-        """Different user keys should produce different composed keys."""
-        delegation_key = b"d" * 32
-        user_key1 = b"a" * 32
-        user_key2 = b"b" * 32
-
-        composed1 = compose_user_key(user_key1, delegation_key)
-        composed2 = compose_user_key(user_key2, delegation_key)
-
-        assert composed1 != composed2
-
-    def test_different_delegation_keys_different_composed(self):
-        """Different delegation keys should produce different composed keys."""
-        composed1 = compose_user_key(USER_KEY, b"a" * 32)
-        composed2 = compose_user_key(USER_KEY, b"b" * 32)
-
-        assert composed1 != composed2
-
-
-class TestEncryptionDecryption:
-    """Test encryption/decryption: C = Enc(D_U), D_U = Dec(C)"""
-
-    def test_round_trip(self):
-        """Dec(Enc(D_U)) should equal D_U."""
-        key = b"k" * 32
-
-        ciphertext = encrypt_data(TEST_DATA, key)
-        plaintext = decrypt_data(ciphertext, key)
-
-        assert plaintext == TEST_DATA
-
-    def test_wrong_key_fails(self):
-        """Decryption with wrong key should produce garbage."""
-        key1 = b"a" * 32
-        key2 = b"b" * 32
-
-        ciphertext = encrypt_data(TEST_DATA, key1)
-        wrong_plaintext = decrypt_data(ciphertext, key2)
-
-        assert wrong_plaintext != TEST_DATA
-
-
-class TestSecurityProperties:
-    """Test security guarantees from specification."""
-
-    def test_insufficient_coalition_cannot_derive_key(self):
+class TestToyExample:
+    """
+    Tests using the exact values from the specification.
+
+    Verifies:
+        H(x||y) = x + y mod 17
+        KDF(z) = z
+        EncAuth_k(m) = (m+k, k+(m+k))
+    """
+
+    def test_primitives_toy_mode(self):
+        """Verify primitives work in toy mode (p=17)."""
+        # KDF(z) = z
+        assert kdf(5, P) == 5
+        assert kdf(11, P) == 11
+
+        # H(x||y) = x + y mod p
+        assert hash_concat(5, 6, P) == 11
+        assert hash_concat(10, 10, P) == 3  # 20 mod 17 = 3
+
+        # Φ(x,y) = KDF(H(x||y)) = x + y mod p
+        assert phi(5, 6, P) == 11
+
+    def test_secret_reconstruction(self):
         """
-        If Σw_i < W, Pr[K_D known] ≈ 0
+        Coalition S = {A_1, A_2} reconstructs s = 5.
 
-        Coalition below threshold cannot create valid secret sharing.
+        Using Lagrange interpolation with shares (1,8) and (2,11).
         """
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = scheme.generate_secret()
+        shares = [
+            Share(x=1, y=SHARES[1]),  # (1, 8)
+            Share(x=2, y=SHARES[2]),  # (2, 11)
+        ]
 
-        # Cannot even share the secret with insufficient coalition
+        s = reconstruct_secret(shares, P)
+        assert s == S  # s = 5
+
+    def test_case1_read_only_delegation(self):
+        """
+        Case 1: Read-Only Delegation
+
+        Expected:
+            K_D^read = KDF(s) = 5
+            K_U^read = K_U + K_D^read = 7 + 5 = 12
+
+        For D_U = 9:
+            C = Enc(9) = 9 + 12 = 21 ≡ 4 mod 17
+            Dec(4) = 4 - 12 = -8 ≡ 9 mod 17
+        """
+        scheme = DelegationScheme(prime=P, w_read=W_READ, w_cap=W_CAP)
+        scheme.master_secret = S
+
+        # Create admins with shares
+        admins = [
+            Administrator(id=1, share=SHARES[1], weight=2, capability_keys={}),
+            Administrator(id=2, share=SHARES[2], weight=1, capability_keys={}),
+        ]
+
+        # Delegate Case 1
+        delegation = scheme.delegate_case1(admins)
+
+        assert delegation.read == 5  # K_D^read = KDF(s) = 5
+        assert delegation.write is None
+        assert delegation.delete is None
+
+        # User derives keys
+        user_keys = scheme.derive_user_keys(K_U, delegation)
+
+        assert user_keys.read == 12  # K_U^read = 7 + 5 = 12
+        assert user_keys.write is None
+        assert user_keys.delete is None
+
+        # Encrypt/Decrypt
+        D_U = 9
+        C = scheme.read_encrypt(D_U, user_keys)
+        assert C == 4  # 9 + 12 = 21 ≡ 4 mod 17
+
+        decrypted = scheme.read_decrypt(C, user_keys)
+        assert decrypted == D_U  # 4 - 12 = -8 ≡ 9 mod 17
+
+    def test_case2_with_write_capability(self):
+        """
+        Case 2: Delegation with Write Capability
+
+        A_1 provides K_1^write = 6.
+
+        Expected:
+            K_D^read = 5
+            K_D^write = Φ(5, 6) = 5 + 6 = 11
+            K_U^read = 7 + 5 = 12
+            K_U^write = 7 + 11 = 18 ≡ 1 mod 17
+        """
+        scheme = DelegationScheme(prime=P, w_read=W_READ, w_cap=W_CAP)
+        scheme.master_secret = S
+
+        # Create admins
+        cap_provider = Administrator(
+            id=1,
+            share=SHARES[1],
+            weight=2,
+            capability_keys={Operation.WRITE: K_1_WRITE},
+        )
+        admin2 = Administrator(id=2, share=SHARES[2], weight=1, capability_keys={})
+
+        # Delegate Case 2 with write capability
+        delegation = scheme.delegate_case2(
+            admins=[cap_provider, admin2],
+            capability_provider=cap_provider,
+            capabilities={Operation.WRITE},
+        )
+
+        assert delegation.read == 5  # K_D^read = 5
+        assert delegation.write == 11  # K_D^write = Φ(5,6) = 11
+        assert delegation.delete is None
+
+        # User derives keys
+        user_keys = scheme.derive_user_keys(K_U, delegation)
+
+        assert user_keys.read == 12  # 7 + 5 = 12
+        assert user_keys.write == 1  # 7 + 11 = 18 ≡ 1 mod 17
+        assert user_keys.delete is None
+
+    def test_authorized_write_accepted(self):
+        """
+        Authorized write with proper key is accepted.
+
+        D_U' = 10:
+            C' = 10 + 1 = 11
+            τ = 1 + 11 = 12
+
+        Server verifies: 1 + 11 = 12 ✓
+        """
+        scheme = DelegationScheme(prime=P, w_read=W_READ, w_cap=W_CAP)
+        scheme.master_secret = S
+
+        # Setup delegation with write
+        cap_provider = Administrator(
+            id=1,
+            share=SHARES[1],
+            weight=2,
+            capability_keys={Operation.WRITE: K_1_WRITE},
+        )
+        admin2 = Administrator(id=2, share=SHARES[2], weight=1, capability_keys={})
+
+        delegation = scheme.delegate_case2(
+            admins=[cap_provider, admin2],
+            capability_provider=cap_provider,
+            capabilities={Operation.WRITE},
+        )
+        user_keys = scheme.derive_user_keys(K_U, delegation)
+
+        # Write with proper key
+        D_U_prime = 10
+        auth_ct = scheme.write_encrypt(D_U_prime, user_keys)
+
+        assert auth_ct is not None
+        assert auth_ct.ciphertext == 11  # 10 + 1 = 11
+        assert auth_ct.tag == 12  # 1 + 11 = 12
+
+        # Server verifies
+        result = scheme.write_verify(auth_ct, user_keys)
+        assert result == D_U_prime  # Accepted, returns 10
+
+    def test_unauthorized_write_rejected(self):
+        """
+        Write attempt with read key is rejected.
+
+        Using K_U^read = 12 instead of K_U^write = 1:
+            C'' = 10 + 12 = 22 ≡ 5 mod 17
+            τ'' = 12 + 5 = 17 ≡ 0 mod 17
+
+        Server checks with K_U^write = 1:
+            Expected: 1 + 5 = 6 ≠ 0
+            Result: DecAuth = ⊥
+        """
+        scheme = DelegationScheme(prime=P, w_read=W_READ, w_cap=W_CAP)
+
+        # Encrypt with wrong key (read key instead of write key)
+        k_u_read = 12  # User's read key
+        k_u_write = 1  # User's write key
+
+        D_U_prime = 10
+
+        # Attacker uses read key
+        wrong_ct = encrypt_auth(D_U_prime, k_u_read, P)
+        assert wrong_ct.ciphertext == 5  # 10 + 12 = 22 ≡ 5
+        assert wrong_ct.tag == 0  # 12 + 5 = 17 ≡ 0
+
+        # Server tries to verify with write key
+        result = decrypt_auth(wrong_ct, k_u_write, P)
+
+        # Expected tag: 1 + 5 = 6, actual tag: 0
+        # Verification fails
+        assert result is None  # ⊥
+
+
+# =============================================================================
+# TEST CASE 1: COALITION THRESHOLD VALIDATION
+# =============================================================================
+
+
+class TestCase1CoalitionThreshold:
+    """
+    Test Case 1: Verify coalition threshold enforcement.
+
+    Scenario:
+        - 3 admins with weights w_1=2, w_2=1, w_3=1
+        - W_read = 3
+        - Valid coalitions: {A_1, A_2}, {A_1, A_3}, {A_2, A_3, A_1}
+        - Invalid: {A_2}, {A_3}, {A_2, A_3}
+
+    Success Criteria:
+        - Valid coalitions can derive delegation keys
+        - Invalid coalitions raise ValueError
+        - Reconstructed secret is correct for all valid coalitions
+    """
+
+    @pytest.fixture
+    def scheme_and_admins(self):
+        """Setup scheme and generate admins."""
+        scheme = DelegationScheme(prime=P, w_read=3, w_cap=3)
+        scheme.setup_secret(S)
+
+        admins = [
+            Administrator(id=1, share=SHARES[1], weight=2, capability_keys={}),
+            Administrator(id=2, share=SHARES[2], weight=1, capability_keys={}),
+            Administrator(id=3, share=SHARES[3], weight=1, capability_keys={}),
+        ]
+
+        return scheme, admins
+
+    def test_valid_coalition_a1_a2(self, scheme_and_admins):
+        """Coalition {A_1, A_2}: weight = 2+1 = 3 >= W_read."""
+        scheme, admins = scheme_and_admins
+        coalition = [admins[0], admins[1]]  # A_1, A_2
+
+        assert scheme.validate_coalition(coalition) is True
+
+        delegation = scheme.delegate_case1(coalition)
+        assert delegation.read == kdf(S, P)
+
+    def test_valid_coalition_a1_a3(self, scheme_and_admins):
+        """Coalition {A_1, A_3}: weight = 2+1 = 3 >= W_read."""
+        scheme, admins = scheme_and_admins
+        coalition = [admins[0], admins[2]]  # A_1, A_3
+
+        assert scheme.validate_coalition(coalition) is True
+
+        delegation = scheme.delegate_case1(coalition)
+        assert delegation.read == kdf(S, P)
+
+    def test_invalid_coalition_a2_a3(self, scheme_and_admins):
+        """Coalition {A_2, A_3}: weight = 1+1 = 2 < W_read."""
+        scheme, admins = scheme_and_admins
+        coalition = [admins[1], admins[2]]  # A_2, A_3
+
+        assert scheme.validate_coalition(coalition) is False
+
+        with pytest.raises(ValueError, match="< W_read"):
+            scheme.delegate_case1(coalition)
+
+    def test_invalid_coalition_single_admin(self, scheme_and_admins):
+        """Single admin A_1: weight = 2 < W_read."""
+        scheme, admins = scheme_and_admins
+        coalition = [admins[0]]  # Only A_1
+
+        assert scheme.validate_coalition(coalition) is False
+
         with pytest.raises(ValueError):
-            scheme.share_secret(secret, {"admin2": 1})  # weight 1 < 3
+            scheme.delegate_case1(coalition)
 
-    def test_admin_alone_cannot_access_data(self):
+
+# =============================================================================
+# TEST CASE 2: READ OPERATION ISOLATION
+# =============================================================================
+
+
+class TestCase2ReadIsolation:
+    """
+    Test Case 2: Verify read-only delegation cannot perform writes.
+
+    Scenario:
+        - User receives read-only delegation (Case 1)
+        - User attempts to perform write operation
+
+    Success Criteria:
+        - User can read/decrypt data successfully
+        - User cannot produce valid write authentication
+        - write_encrypt returns None (no write key)
+    """
+
+    @pytest.fixture
+    def read_only_user(self):
+        """Setup user with read-only delegation."""
+        scheme = DelegationScheme(prime=P, w_read=W_READ, w_cap=W_CAP)
+        scheme.master_secret = S
+
+        admins = [
+            Administrator(id=1, share=SHARES[1], weight=2, capability_keys={}),
+            Administrator(id=2, share=SHARES[2], weight=1, capability_keys={}),
+        ]
+
+        delegation = scheme.delegate_case1(admins)
+        user_keys = scheme.derive_user_keys(K_U, delegation)
+
+        return scheme, user_keys
+
+    def test_read_operation_succeeds(self, read_only_user):
+        """User with read-only can read data."""
+        scheme, user_keys = read_only_user
+
+        data = 9
+        ciphertext = scheme.read_encrypt(data, user_keys)
+        decrypted = scheme.read_decrypt(ciphertext, user_keys)
+
+        assert decrypted == data
+
+    def test_write_operation_blocked(self, read_only_user):
+        """User with read-only cannot write."""
+        scheme, user_keys = read_only_user
+
+        assert user_keys.write is None  # No write key
+
+        result = scheme.write_encrypt(10, user_keys)
+        assert result is None  # Cannot create authenticated write
+
+    def test_delete_operation_blocked(self, read_only_user):
+        """User with read-only cannot delete."""
+        scheme, user_keys = read_only_user
+
+        assert user_keys.delete is None  # No delete key
+
+        result = scheme.delete_encrypt(1, user_keys)
+        assert result is None  # Cannot create authenticated delete
+
+
+# =============================================================================
+# TEST CASE 3: CAPABILITY DELEGATION AND VERIFICATION
+# =============================================================================
+
+
+class TestCase3CapabilityDelegation:
+    """
+    Test Case 3: Full capability delegation workflow.
+
+    Scenario:
+        - Admin A_1 provides write and delete capability keys
+        - User receives full delegation (Case 2)
+        - User performs read, write, and delete operations
+        - Server verifies each operation
+
+    Success Criteria:
+        - All operation keys are derived correctly
+        - Authenticated ciphertexts pass verification
+        - Cross-operation attacks fail (using wrong key)
+    """
+
+    @pytest.fixture
+    def full_delegation(self):
+        """Setup user with full capability delegation."""
+        scheme = DelegationScheme(prime=P, w_read=W_READ, w_cap=W_CAP)
+        scheme.master_secret = S
+
+        cap_provider = Administrator(
+            id=1,
+            share=SHARES[1],
+            weight=2,
+            capability_keys={
+                Operation.WRITE: K_1_WRITE,
+                Operation.DELETE: 10,  # K_1^delete = 10
+            },
+        )
+        admin2 = Administrator(id=2, share=SHARES[2], weight=1, capability_keys={})
+
+        delegation = scheme.delegate_case2(
+            admins=[cap_provider, admin2],
+            capability_provider=cap_provider,
+            capabilities={Operation.WRITE, Operation.DELETE},
+        )
+        user_keys = scheme.derive_user_keys(K_U, delegation)
+
+        return scheme, user_keys
+
+    def test_all_operation_keys_derived(self, full_delegation):
+        """All operation keys should be derived."""
+        scheme, user_keys = full_delegation
+
+        assert user_keys.read is not None
+        assert user_keys.write is not None
+        assert user_keys.delete is not None
+
+    def test_write_operation_verified(self, full_delegation):
+        """Write operation produces valid authentication."""
+        scheme, user_keys = full_delegation
+
+        data = 10
+        auth_ct = scheme.write_encrypt(data, user_keys)
+
+        assert auth_ct is not None
+
+        # Server verification
+        result = scheme.write_verify(auth_ct, user_keys)
+        assert result == data
+
+    def test_delete_operation_verified(self, full_delegation):
+        """Delete operation produces valid authentication."""
+        scheme, user_keys = full_delegation
+
+        resource_id = 5
+        auth_ct = scheme.delete_encrypt(resource_id, user_keys)
+
+        assert auth_ct is not None
+
+        # Server verification
+        result = scheme.delete_verify(auth_ct, user_keys)
+        assert result == resource_id
+
+    def test_cross_operation_attack_fails(self, full_delegation):
         """
-        Without K_U, Pr[admin gets D_U] ≈ 0
+        Using write key for delete verification fails.
 
-        Admin has delegation key but not user key.
+        Even with valid authenticated ciphertext for write,
+        it should fail verification as a delete operation.
         """
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = scheme.generate_secret()
+        scheme, user_keys = full_delegation
 
-        # Admin creates delegation key
-        delegation = scheme.derive_delegation_key_scheme1(secret)
+        # Create valid write ciphertext
+        write_ct = scheme.write_encrypt(10, user_keys)
 
-        # User encrypts data with composed key
-        composed_key = compose_user_key(USER_KEY, delegation.key)
-        ciphertext = encrypt_data(TEST_DATA, composed_key)
+        # Try to pass it off as delete operation
+        # (using delete verification with write ciphertext)
+        fake_delete_ct = AuthenticatedCiphertext(
+            ciphertext=write_ct.ciphertext, tag=write_ct.tag
+        )
 
-        # Admin tries to decrypt with just delegation key (wrong)
-        wrong_plaintext = decrypt_data(ciphertext, delegation.key)
-        assert wrong_plaintext != TEST_DATA
-
-    def test_user_alone_cannot_access_data(self):
-        """
-        Without K_D, user cannot decrypt.
-
-        User has their key but no delegation from admins.
-        """
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = scheme.generate_secret()
-
-        # Create correct composed key
-        delegation = scheme.derive_delegation_key_scheme1(secret)
-        composed_key = compose_user_key(USER_KEY, delegation.key)
-
-        # Encrypt data
-        ciphertext = encrypt_data(TEST_DATA, composed_key)
-
-        # User tries with only their key (wrong)
-        wrong_plaintext = decrypt_data(ciphertext, USER_KEY)
-        assert wrong_plaintext != TEST_DATA
-
-    def test_admin_and_user_together_can_access(self):
-        """
-        Admin coalition + user = successful access.
-        """
-        scheme = DelegationScheme(threshold=THRESHOLD)
-        secret = scheme.generate_secret()
-
-        # Admin coalition creates and shares secret
-        shares = scheme.share_secret(secret, {"admin1": 2, "admin2": 1})
-
-        # Reconstruct
-        all_shares = shares["admin1"] + shares["admin2"]
-        reconstructed = scheme.reconstruct_secret(all_shares)
-
-        # Derive delegation key
-        delegation = scheme.derive_delegation_key_scheme1(reconstructed)
-
-        # User composes key
-        composed_key = compose_user_key(USER_KEY, delegation.key)
-
-        # Encrypt and decrypt
-        ciphertext = encrypt_data(TEST_DATA, composed_key)
-        plaintext = decrypt_data(ciphertext, composed_key)
-
-        assert plaintext == TEST_DATA
-
-
-class TestEndToEndScenarios:
-    """Complete workflow tests."""
-
-    def test_scheme1_full_workflow(self):
-        """
-        Full Scheme 1 workflow:
-        1. Admins form coalition
-        2. Generate and share secret
-        3. Derive K_D = KDF(s)
-        4. User composes K_U* = KDF(K_U || K_D)
-        5. Encrypt/decrypt data
-        """
-        # Setup
-        scheme = DelegationScheme(threshold=THRESHOLD)
-
-        # Step 1-2: Coalition generates secret
-        secret = scheme.generate_secret()
-        shares = scheme.share_secret(secret, {"admin1": 2, "admin2": 1})
-
-        # Step 3: Reconstruct and derive K_D
-        all_shares = shares["admin1"] + shares["admin2"]
-        reconstructed = scheme.reconstruct_secret(all_shares)
-        delegation = scheme.derive_delegation_key_scheme1(reconstructed)
-
-        # Step 4: User composes key
-        user_composed = compose_user_key(USER_KEY, delegation.key)
-
-        # Step 5: Encrypt/decrypt
-        ciphertext = encrypt_data(TEST_DATA, user_composed)
-        plaintext = decrypt_data(ciphertext, user_composed)
-
-        assert plaintext == TEST_DATA
-        assert delegation.capabilities == set()  # read-only
-
-    def test_scheme2_full_workflow(self):
-        """
-        Full Scheme 2 workflow with capabilities:
-        1. Admins form coalition
-        2. Generate and share secret
-        3. Derive K_D^C = KDF(H(s || caps))
-        4. User composes K_U* = KDF(K_U || K_D^C)
-        5. Encrypt/decrypt data
-        """
-        # Setup
-        scheme = DelegationScheme(threshold=THRESHOLD)
-
-        # Step 1-2: Coalition generates secret
-        secret = scheme.generate_secret()
-        shares = scheme.share_secret(secret, {"admin1": 2, "admin2": 1})
-
-        # Step 3: Reconstruct and derive K_D^C with read+write
-        all_shares = shares["admin1"] + shares["admin2"]
-        reconstructed = scheme.reconstruct_secret(all_shares)
-
-        caps = {
-            Capability.READ: CAPABILITY_KEYS[Capability.READ],
-            Capability.WRITE: CAPABILITY_KEYS[Capability.WRITE],
-        }
-        delegation = scheme.derive_delegation_key_scheme2(reconstructed, caps)
-
-        # Step 4: User composes key
-        user_composed = compose_user_key(USER_KEY, delegation.key)
-
-        # Step 5: Encrypt/decrypt
-        ciphertext = encrypt_data(TEST_DATA, user_composed)
-        plaintext = decrypt_data(ciphertext, user_composed)
-
-        assert plaintext == TEST_DATA
-        assert delegation.capabilities == {Capability.READ, Capability.WRITE}
+        # Verify with delete key should fail
+        # (unless by chance the keys are equal, check they're not)
+        if user_keys.write != user_keys.delete:
+            result = scheme.delete_verify(fake_delete_ct, user_keys)
+            assert result is None  # Verification fails

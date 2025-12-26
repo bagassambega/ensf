@@ -6,9 +6,10 @@ Implementation of Weighted Secret Sharing with Delegation for Access Control.
 
 - **n Administrators** with configurable weights
 - **Weighted Coalition Threshold** for delegation authorization
-- **Scheme 1**: Basic delegation (read-only)
-- **Scheme 2**: Capability-enhanced delegation (read/write/delete)
-- **User Key Composition**: K_U* = KDF(K_U || K_D)
+- **Case 1**: Read-only delegation (K_D^read = KDF(s))
+- **Case 2**: Capability-enhanced delegation (K_D^op = Φ(s, K_j^op))
+- **User Key Composition**: K_U^op = KDF(K_U || K_D^op)
+- **Authenticated Encryption** for write/delete operations
 
 ## Installation
 
@@ -21,35 +22,43 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
-## Usage
+## Running Tests
 
 ```bash
-# Initialize system with threshold W
-ensf init --threshold 3
+# Activate virtual environment
+source .venv/bin/activate
 
-# Add administrators
-ensf add-admin admin1 --weight 2
-ensf add-admin admin2 --weight 1
+# Run all tests
+pytest tests/ -v
 
-# Add user
-ensf add-user user1
+# Run only delegation algorithm tests
+pytest tests/test_delegation.py -v
 
-# Create delegation key (Scheme 1 - read only)
-ensf delegate -a admin1,admin2 -n delegation1
+# Run only directory encryption tests
+pytest tests/test_folder_encryption.py -v
 
-# Create delegation key (Scheme 2 - with capabilities)
-ensf delegate -a admin1,admin2 -n delegation2 -c read,write -p admin1
-
-# Export keys for distribution
-ensf export user-key user1 -o user1.key
-ensf export delegation delegation1 -o delegation1.key
-
-# Encrypt user data
-ensf encrypt -u user1 -d delegation1 secret.txt secret.enc
-
-# Decrypt (requires both user key and delegation key)
-ensf decrypt -u user1.key -d delegation1.key secret.enc secret.txt
+# Run with coverage
+pytest tests/ --cov=ensf
 ```
+
+### Test Cases
+
+| Test File | Description |
+|-----------|-------------|
+| `test_shamir.py` | Shamir Secret Sharing primitives |
+| `test_delegation.py` | Delegation schemes (Case 1 & 2) with toy example (p=17) |
+| `test_folder_encryption.py` | Directory encryption with 5 security scenarios |
+
+### Directory Encryption Test Scenarios
+
+| # | Scenario | Expected Result |
+|---|----------|-----------------|
+| 1 | Admin grants read-only | Decrypt succeeds |
+| 2 | User manipulates K_D^read | Decrypt fails |
+| 3 | Wrong user key K_U | Decrypt fails |
+| 4 | Admin grants write capability | Verify succeeds |
+| 5a | User fakes K_D^write | Verify fails |
+| 5b | User tampers auth tag | Verify fails |
 
 ## Security Guarantees
 
@@ -57,3 +66,8 @@ ensf decrypt -u user1.key -d delegation1.key secret.enc secret.txt
 - Admin alone → cannot decrypt user data
 - User alone → cannot decrypt user data
 - Admin + User with delegation → can decrypt
+- Read-only delegation → cannot perform write/delete
+
+## Documentation
+
+See [explanation.md](explanation.md) for algorithm-to-code mapping.
